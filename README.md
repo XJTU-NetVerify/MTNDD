@@ -1,4 +1,4 @@
-# Parallel MTNDD
+# MTNDD — Parallel Implementation
 
 **Multi-Terminal Network Decision Diagram (MTNDD)** represents symbolic functions
 whose values may be Boolean, rational, or floating point. Like NDD, each node
@@ -6,12 +6,25 @@ branches on a field, and each edge represents a set of field values rather than
 one concrete value. Numeric terminals extend this structure to weighted counts,
 probabilities, costs, and other algebraic computations.
 
-The `parallel-MTNDD` branch provides a **C11 core + JNI + Java instance API**.
+The `parallel` branch provides a **C11 core + JNI + Java instance API**.
 It supports BDD, BCDD, ZDD, BITSET, and mixed fields, with parallel arithmetic,
 sum abstraction, fused multiplication and abstraction, and explicit root ownership.
 The implementation shares the compact native manager and Lace scheduling
 infrastructure with the Boolean [`parallel`](https://github.com/XJTU-NetVerify/NDD/tree/parallel)
 branch.
+
+## Choose a Branch
+
+| Branch | Implementation | Numeric domains | Java entry point |
+| --- | --- | --- | --- |
+| [`main`](https://github.com/XJTU-NetVerify/MTNDD/tree/main) | Java | Rational, double, interval | `org.ants.jndd.diagram.NDD` |
+| [`parallel`](https://github.com/XJTU-NetVerify/MTNDD/tree/parallel) (this branch) | C11 + JNI, Lace worker pool | Checked rational, finite double | `org.ants.jndd.parallel.ParallelMTNDD` |
+
+MTNDD was extracted from [NDD](https://github.com/XJTU-NetVerify/NDD), preserving the commit
+history of `mtndd` as `main` and `parallel-MTNDD` as `parallel`. Boolean-only NDD remains in
+that repository. Historical Java package names and the Maven artifact `org.ants:ndd:1.0.1`
+are retained for compatibility. The two MTNDD branches have different APIs and numeric policies;
+see [migration notes](mtndd/docs/MIGRATION.md) before porting an application.
 
 ## Build
 
@@ -22,9 +35,9 @@ Requirements:
 - JDK 11 or newer and Maven 3.x
 
 ```bash
-git clone --branch parallel-MTNDD https://github.com/XJTU-NetVerify/NDD.git
-cd NDD
-export JAVA_HOME=/path/to/jdk
+git clone --branch parallel https://github.com/XJTU-NetVerify/MTNDD.git
+cd MTNDD
+export JAVA_HOME=/path/to/jdk # replace with your JDK installation
 
 cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release
 cmake --build native/build -j6
@@ -156,18 +169,19 @@ operation can run in parallel. `ParallelNDD` and `ParallelMTNDD` share an
 admission gate, allowing one active native engine at a time. An engine can be
 closed before switching to the other API.
 
-### Relationship to Other Branches
+### Relationship to NDD and the Java Core
 
-| Branch | Core | Terminals | Java API |
-| --- | --- | --- | --- |
-| [`main`](https://github.com/XJTU-NetVerify/NDD/tree/main) | Java NDD | Boolean | Existing NDD API |
-| [`parallel`](https://github.com/XJTU-NetVerify/NDD/tree/parallel) | C + JNI | Boolean | `ParallelNDD`, `NDDNode` |
-| [`mtndd`](https://github.com/XJTU-NetVerify/NDD/tree/mtndd) | Java MTNDD | Numeric and Boolean | Historical `NDD` package |
-| `parallel-MTNDD` | Shared C manager + numeric extension + JNI | Rational or double, including Boolean | `ParallelMTNDD`, `MTNDDNode` |
+The [Java MTNDD core](https://github.com/XJTU-NetVerify/MTNDD/tree/main) offers the historical
+static `NDD` API with rational, double, and interval modes. Its `satCount` counts matches to a
+target value (default `1`); this branch's `satCount` counts nonzero assignments. Its rational
+implementation may round fractions that outgrow exact storage, while this native core reports
+overflow. The [Boolean parallel NDD core](https://github.com/XJTU-NetVerify/NDD/tree/parallel)
+provides `ParallelNDD` and `NDDNode` without numeric terminals.
 
 This branch draws backend dispatch, dense import, and fused abstraction designs
-from `mtndd`. It reuses `native/src/pndd.c` and the production optimization
-settings from `parallel`, adding the numeric algorithms in `pmtndd_impl.inc`.
+from the Java implementation (formerly `NDD/mtndd`). It reuses `native/src/pndd.c` and
+the production optimization settings from `NDD/parallel`, adding the numeric algorithms
+in `pmtndd_impl.inc`.
 Interval terminals, approximate clustering, and n-ary contraction have not been
 ported. [Migration notes and provenance](mtndd/docs/MIGRATION.md) describe these
 choices and semantic differences.
@@ -195,59 +209,18 @@ The new interfaces and admission path passed the seven native Release cases,
 ASan/UBSan numeric rechecks, and 43 Java tests. These checks do not establish
 application speedup; LLVF carries separate fixed-input, paired-process reports.
 
-## Benchmark
+## Benchmark and Validation Records
 
-The following results are **historical measurements of the MTPNDD prototype**,
-retained from its original repository. They are not measurements of the current
-shared core. Four sweeps from April 22, 2026 contain 168 observations, with one
-sample per configuration and incomplete machine metadata.
+The [historical benchmark report](mtndd/results/upstream-20260422/README.md) contains four
+April 22, 2026 N-Queens sweeps (168 observations) from the earlier MTPNDD prototype. The
+[archived SRE report](mtndd/docs/optimization-results-summary.md) also measures that prototype.
+These reports use one sample per configuration or incomplete machine metadata, and do not
+measure the current shared core. N-Queens exercises Boolean constraints rather than arithmetic
+throughput. Cross-version times should not be divided to infer speedup.
 
-### N-Queens
-
-The serial/Release variant constructs constraints sequentially while allowing
-parallel work inside operations. Timing includes field declaration, constraint
-construction, combination, and counting; runtime initialization and shutdown
-are excluded. Self-scaling is `T(1) / T(6)`.
-
-| N | 1 worker s | 2 workers s | 4 workers s | 6 workers s | Self-scaling | Solutions |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 | 0.237 | 0.165 | 0.113 | 0.093 | 2.55× | 724 |
-| 11 | 1.171 | 0.724 | 0.446 | 0.344 | 3.40× | 2,680 |
-| 12 | 6.021 | 3.697 | 2.132 | 1.540 | **3.91×** | 14,200 |
-| 13 | 35.491 | 21.361 | 12.071 | 8.592 | **4.13×** | 73,712 |
-
-Six-worker results for the other build and construction variants:
-
-| N | Serial Release s | Serial PGO+LTO s | Parallel Release s | Parallel PGO+LTO s |
-| ---: | ---: | ---: | ---: | ---: |
-| 10 | 0.093 | 0.098 | 0.081 | 0.080 |
-| 11 | 0.344 | 0.311 | 0.299 | 0.295 |
-| 12 | 1.540 | 1.478 | 1.508 | 1.473 |
-| 13 | 8.592 | 8.674 | 8.526 | 8.225 |
-
-The parallel variant adds tasks for constraint construction; final combination
-remains a sequential fold. PGO is not faster in every case: the serial N=13
-sample is about 1% slower than Release. Full N=7–13, workers=1–6 samples,
-source hashes, and the summary script are linked in the
-[historical benchmark report](mtndd/results/upstream-20260422/README.md).
-
-N-Queens exercises the Boolean special case of MTNDD. It does not establish
-arithmetic throughput or performance on algebraic applications. No new algebraic
-application measurements have been added to this branch.
-
-### Archived SRE Results
-
-The prototype's earlier SRE report records limited native scaling:
-
-| Workload | 1 worker s | 6 workers s | Self-scaling |
-| --- | ---: | ---: | ---: |
-| fattree12 / MF1 | 19.915 | 21.579 | 0.92× |
-| fattree12 / MF3 | 412.009 | 371.782 | 1.11× |
-
-See the [original SRE report](mtndd/docs/optimization-results-summary.md).
-These measurements and the newer Boolean `parallel` results use different
-versions and measurement cohorts; their times should not be divided to infer
-a cross-branch speedup.
+The [shared-core validation record](mtndd/results/validation-20261013-shared-core/README.md)
+contains correctness and resource-management results. Application-level performance reports
+are maintained separately in the companion LLVF project.
 
 ## Tests
 
