@@ -5,19 +5,36 @@ terminal nodes may hold numeric values instead of only Boolean `false` and `true
 for symbolic functions such as route weights, traffic or link load, probabilities, costs, and
 integer matrices, while retaining NDD's field-level structure.
 
-This branch contains the standalone MTNDD core migrated from the implementation used by
-[`llvf`](https://github.com/XJTU-NetVerify/llvf). The current core supports standard BDD,
-complemented-edge BDD (BCDD), and set-family ZDD edge labels. A single MTNDD may assign different
-label backends to different fields.
+This repository provides Java and parallel native implementations of MTNDD, extracted from
+[NDD](https://github.com/XJTU-NetVerify/NDD) with their commit history preserved. The Java core
+originated in [`llvf`](https://github.com/XJTU-NetVerify/llvf). Both implementations support
+BDD, complemented-edge BDD (BCDD), ZDD, BITSET, and mixed label backends.
+
+## Choose a Branch
+
+| Branch | Implementation | Numeric domains | Java entry point |
+| --- | --- | --- | --- |
+| [`main`](https://github.com/XJTU-NetVerify/MTNDD/tree/main) (this branch) | Java | Rational, double, interval | `org.ants.jndd.diagram.NDD` |
+| [`parallel`](https://github.com/XJTU-NetVerify/MTNDD/tree/parallel) | C11 + JNI, Lace worker pool | Checked rational, finite double | `org.ants.jndd.parallel.ParallelMTNDD` |
+
+Use `main` for the Java implementation and its richer numeric modes; use `parallel` for
+native parallel operations and an instance API with explicit root ownership. The APIs and
+numeric policies differ; switching branches requires adapting application code. Boolean-only
+NDD development remains in the [NDD repository](https://github.com/XJTU-NetVerify/NDD).
+
+The source branches were `NDD/mtndd` and `NDD/parallel-MTNDD`, respectively. Historical package
+names and the Maven artifact `org.ants:ndd:1.0.1` are retained for compatibility.
 
 ## Build
 
 Requirements:
 
-- JDK 8 or newer
+- JDK 11 or newer (Java sources target Java 8 bytecode)
 - Maven 3.x
 
 ```bash
+git clone https://github.com/XJTU-NetVerify/MTNDD.git
+cd MTNDD
 mvn -DskipTests package
 ```
 
@@ -35,27 +52,40 @@ The historical Java package name `org.ants.jndd` is retained for source compatib
 ```java
 import org.ants.jndd.diagram.NDD;
 
-NDD.initNDD(
-    1_000_000, // MTNDD node-table threshold
-    100_000,   // MTNDD operation-cache size
-    1_000_000, // default label node-table size
-    100_000    // default label operation-cache size
-);
+public class MTNDDExample {
+    public static void main(String[] args) {
+        NDD.initNDD(20_000, 2_000, 10_000, 1_000);
+        int header = NDD.declareField(2, NDD.LabelMode.BDD);
+        int links = NDD.declareField(2, NDD.LabelMode.ZDD);
+        NDD.generateFields();
 
-int header = NDD.declareField(32, NDD.LabelMode.BDD);
-int links  = NDD.declareField(16, NDD.LabelMode.ZDD);
-int state  = NDD.declareField(4, NDD.LabelMode.COMPLEMENTED_BDD);
-NDD.generateFields();
-
-NDD headerBit = NDD.getVar(header, 0);
-NDD linkBit = NDD.getVar(links, 0);
-NDD selected = headerBit.and(linkBit);
-
-NDD weighted = selected.times(NDD.createTerminal(10)).withRef();
-double assignmentCount = NDD.satCount(selected);
-
-weighted.recursiveDeref();
+        NDD selected = NDD.getVar(header, 0).and(NDD.getVar(links, 0)).withRef();
+        NDD weight = NDD.createTerminal(10).withRef();
+        NDD weighted = selected.times(weight).withRef();
+        try {
+            System.out.println(NDD.satCount(selected));          // 4.0
+            System.out.println(NDD.satCount(weighted, 0, 10));   // 4.0
+        } finally {
+            weighted.recursiveDeref();
+            weight.recursiveDeref();
+            selected.recursiveDeref();
+        }
+    }
+}
 ```
+
+Save the example as `MTNDDExample.java`, then compile and run it:
+
+```bash
+javac -cp target/ndd-1.0.1-jar-with-dependencies.jar MTNDDExample.java
+java -cp .:target/ndd-1.0.1-jar-with-dependencies.jar MTNDDExample
+```
+
+Each two-bit field has four assignments. Selecting one bit in each field leaves four complete
+assignments, with value `10` in `weighted` and `0` elsewhere. In this Java API, `satCount(f)`
+counts assignments whose value matches `1`; `satCount(f, 0, target)` counts matches to the
+specified integer terminal using the implementation's numeric tolerance. It does not sum weights.
+The parallel API instead counts nonzero assignments. Use `sumAbstract` for weighted sums.
 
 The required initialization order is:
 
@@ -65,7 +95,7 @@ The required initialization order is:
 4. call `generateFields()` once
 5. construct and manipulate diagrams
 
-`declareField(width)` uses BDD labels by default. Fields using the same mode share one label
+`declareField(width)` uses BDD labels by default. Use the returned field IDs in subsequent calls. Fields using the same mode share one label
 engine and a right-aligned variable layout; BDD, BCDD, and ZDD fields use separate engines.
 
 ## Backend Configuration
@@ -131,6 +161,25 @@ The primary implementation is `org.ants.jndd.diagram.NDD`. `NDDManager` is a sma
 facade. The WAN paths and atomized prototypes are retained for research reference and are excluded
 from the default Maven compilation where noted in `pom.xml`.
 
+## Numeric Semantics
+
+`TerminalMode.RATIONAL` is the default and stores normalized `long` numerators and denominators.
+It is not arbitrary-precision arithmetic: operations use wider intermediates where needed, and
+fractions that exceed the exact representation may fall back to decimal rounding at
+`Rational.getDefaultScale()` (configurable with `Rational.setDefaultScale(...)`). Values still
+outside the storage range can fail. This policy differs from the parallel core's checked rational
+arithmetic, which reports overflow.
+
+`TerminalMode.DOUBLE` supports optional clustering and near-zero pruning.
+`TerminalMode.INTERVAL` supports outward-rounded bounds and configurable enclosure policies.
+These modes and their approximation settings must be selected during initialization; the
+parallel branch does not implement interval terminals or approximate clustering.
+
+The Java core has static global state. Initialize it before constructing diagrams; reinitializing
+replaces that state. Protect every intermediate that must survive later allocations or collection.
+See the [mixed-backend regression tests](src/test/java/org/ants/jndd/diagram/NDDMixedBackendTest.java)
+for numeric modes, abstraction, and collection examples.
+
 ## Implementation Notes
 
 - MTNDD nodes and physical edges are stored in primitive arrays and canonicalized by a unique
@@ -153,8 +202,9 @@ from the default Maven compilation where noted in `pom.xml`.
   performance diagnosis.
 
 See the [MTNDD wiki page](https://github.com/XJTU-NetVerify/NDD/wiki/MTNDD) for the algorithm and
-interface model. The original NDD paper and NDD-specific design material remain available in the
-repository wiki and are not repeated here.
+interface model. The [original NDD paper (NSDI 2025)](https://www.usenix.org/system/files/nsdi25-li-zechun.pdf)
+and NDD-specific design material remain available through the original project. The wiki link
+above intentionally points to NDD; repository extraction does not copy GitHub wiki pages.
 
 ## License
 
